@@ -41,6 +41,7 @@ pub fn init(opt: Options) -> Result<()> {
     save_file(
         &opt.cache_file,
         config::Cache {
+            copies: Default::default(),
             symlinks: BTreeMap::default(),
             templates: BTreeMap::default(),
         },

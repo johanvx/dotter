@@ -5,14 +5,16 @@ use anyhow::{Context, Result};
 use crossterm::style::Stylize;
 use handlebars::Handlebars;
 
-use crate::config::{SymbolicTarget, TemplateTarget, Variables};
+use crate::config::{CopyTarget, SymbolicTarget, TemplateTarget, Variables};
 use crate::difference::{self, diff_nonempty, generate_template_diff, print_diff};
 use crate::filesystem::{Filesystem, SymlinkComparison, TemplateComparison};
 
 #[cfg_attr(test, mockall::automock)]
 pub trait ActionRunner {
+    fn delete_copy(&mut self, source: &Path, target: &Path) -> Result<bool>;
     fn delete_symlink(&mut self, source: &Path, target: &Path) -> Result<bool>;
     fn delete_template(&mut self, source: &Path, cache: &Path, target: &Path) -> Result<bool>;
+    fn create_copy(&mut self, source: &Path, target: &CopyTarget) -> Result<bool>;
     fn create_symlink(&mut self, source: &Path, target: &SymbolicTarget) -> Result<bool>;
     fn create_template(
         &mut self,
@@ -20,6 +22,7 @@ pub trait ActionRunner {
         cache: &Path,
         target: &TemplateTarget,
     ) -> Result<bool>;
+    fn update_copy(&mut self, source: &Path, target: &CopyTarget) -> Result<bool>;
     fn update_symlink(&mut self, source: &Path, target: &SymbolicTarget) -> Result<bool>;
     fn update_template(
         &mut self,
@@ -56,11 +59,17 @@ impl<'a> RealActionRunner<'a> {
 }
 
 impl ActionRunner for RealActionRunner<'_> {
+    fn delete_copy(&mut self, source: &Path, target: &Path) -> Result<bool> {
+        delete_copy(source, target, self.fs, self.force)
+    }
     fn delete_symlink(&mut self, source: &Path, target: &Path) -> Result<bool> {
         delete_symlink(source, target, self.fs, self.force)
     }
     fn delete_template(&mut self, source: &Path, cache: &Path, target: &Path) -> Result<bool> {
         delete_template(source, cache, target, self.fs, self.force)
+    }
+    fn create_copy(&mut self, source: &Path, target: &CopyTarget) -> Result<bool> {
+        create_copy(source, target, self.fs, self.force)
     }
     fn create_symlink(&mut self, source: &Path, target: &SymbolicTarget) -> Result<bool> {
         create_symlink(source, target, self.fs, self.force)
@@ -80,6 +89,9 @@ impl ActionRunner for RealActionRunner<'_> {
             self.variables,
             self.force,
         )
+    }
+    fn update_copy(&mut self, source: &Path, target: &CopyTarget) -> Result<bool> {
+        update_copy(source, target, self.fs, self.force)
     }
     fn update_symlink(&mut self, source: &Path, target: &SymbolicTarget) -> Result<bool> {
         update_symlink(source, target, self.fs, self.force)
@@ -104,6 +116,51 @@ impl ActionRunner for RealActionRunner<'_> {
 }
 
 // == DELETE ==
+
+/// Returns true if copy should be deleted from cache
+pub fn delete_copy(
+    source: &Path,
+    target: &Path,
+    fs: &mut dyn Filesystem,
+    force: bool,
+) -> Result<bool> {
+    info!("{} copy {:?} -> {:?}", "[-]".red(), source, target);
+
+    let comparison = fs
+        .compare_template(target, source)
+        .context("detect copy's current state")?;
+    debug!("Current state: {}", comparison);
+
+    match comparison {
+        TemplateComparison::Identical | TemplateComparison::OnlyTargetExists => {
+            debug!("Performing deletion");
+            fs.remove_file(target).context("perform copy target deletion")?;
+            Ok(true)
+        }
+        TemplateComparison::OnlyCacheExists | TemplateComparison::BothMissing => {
+            warn!(
+                "Deleting copy {:?} -> {:?} but target doesn't exist. Removing from cache anyways.",
+                source, target
+            );
+            Ok(true)
+        }
+        TemplateComparison::Changed | TemplateComparison::TargetNotRegularFile if force => {
+            warn!(
+                "Deleting copy {:?} -> {:?} but {}. Forcing.",
+                source, target, comparison
+            );
+            fs.remove_file(target).context("perform copy target deletion")?;
+            Ok(true)
+        }
+        TemplateComparison::Changed | TemplateComparison::TargetNotRegularFile => {
+            error!(
+                "Deleting {:?} -> {:?} but {}. Skipping.",
+                source, target, comparison
+            );
+            Ok(false)
+        }
+    }
+}
 
 /// Returns true if symlink should be deleted from cache
 pub fn delete_symlink(
@@ -233,6 +290,83 @@ fn perform_template_target_deletion(fs: &mut dyn Filesystem, target: &Path) -> R
 }
 
 // == CREATE ==
+
+/// Returns true if copy should be added to cache
+pub fn create_copy(
+    source: &Path,
+    target: &CopyTarget,
+    fs: &mut dyn Filesystem,
+    force: bool,
+) -> Result<bool> {
+    info!(
+        "{} copy {:?} -> {:?}",
+        "[+]".green(),
+        source,
+        target.target
+    );
+
+    let comparison = fs
+        .compare_template(&target.target, source)
+        .context("detect copy's current state")?;
+    debug!("Current state: {}", comparison);
+
+    match comparison {
+        TemplateComparison::OnlyCacheExists | TemplateComparison::BothMissing => {
+            debug!("Performing creation");
+            fs.create_dir_all(
+                target
+                    .target
+                    .parent()
+                    .context("get parent of target file")?,
+                &target.owner,
+            )
+            .context("create parent for target file")?;
+            fs.copy_file(source, &target.target, &target.owner)
+                .context("create target copy")?;
+            Ok(true)
+        }
+        TemplateComparison::Identical => {
+            warn!(
+                "Creating copy {:?} -> {:?} but target already exists and matches source. Adding to cache anyways",
+                source, target.target
+            );
+            Ok(true)
+        }
+        TemplateComparison::OnlyTargetExists => {
+            error!(
+                "Creating copy {:?} -> {:?} but {}. Skipping.",
+                source, target.target, comparison
+            );
+            Ok(false)
+        }
+        TemplateComparison::Changed | TemplateComparison::TargetNotRegularFile if force => {
+            warn!(
+                "Creating copy {:?} -> {:?} but {}. Forcing.",
+                source, target.target, comparison
+            );
+            fs.remove_file(&target.target)
+                .context("remove copy target while forcing")?;
+            fs.create_dir_all(
+                target
+                    .target
+                    .parent()
+                    .context("get parent of target file")?,
+                &target.owner,
+            )
+            .context("create parent for target file")?;
+            fs.copy_file(source, &target.target, &target.owner)
+                .context("create target copy")?;
+            Ok(true)
+        }
+        TemplateComparison::Changed | TemplateComparison::TargetNotRegularFile => {
+            error!(
+                "Creating copy {:?} -> {:?} but {}. Skipping.",
+                source, target.target, comparison
+            );
+            Ok(false)
+        }
+    }
+}
 
 /// Returns true if symlink should be added to cache
 pub fn create_symlink(
@@ -393,6 +527,78 @@ pub fn create_template(
 }
 
 // == UPDATE ==
+
+/// Returns true if the copy wasn't skipped
+pub fn update_copy(
+    source: &Path,
+    target: &CopyTarget,
+    fs: &mut dyn Filesystem,
+    force: bool,
+) -> Result<bool> {
+    debug!("Updating copy {:?} -> {:?}...", source, target.target);
+
+    let comparison = fs
+        .compare_template(&target.target, source)
+        .context("detect copy's current state")?;
+    debug!("Current state: {}", comparison);
+
+    match comparison {
+        TemplateComparison::Identical => {
+            debug!("Performing update");
+            Ok(true)
+        }
+        TemplateComparison::OnlyTargetExists | TemplateComparison::BothMissing => {
+            error!(
+                "Updating copy {:?} -> {:?} but source is missing. Skipping.",
+                source, target.target
+            );
+            Ok(false)
+        }
+        TemplateComparison::Changed | TemplateComparison::TargetNotRegularFile if force => {
+            warn!(
+                "Updating copy {:?} -> {:?} but {}. Forcing.",
+                source, target.target, comparison
+            );
+            fs.remove_file(&target.target)
+                .context("remove copy target while forcing")?;
+            fs.create_dir_all(
+                target
+                    .target
+                    .parent()
+                    .context("get parent of target file")?,
+                &target.owner,
+            )
+            .context("create parent for target file")?;
+            fs.copy_file(source, &target.target, &target.owner)
+                .context("create target copy")?;
+            Ok(true)
+        }
+        TemplateComparison::Changed | TemplateComparison::TargetNotRegularFile => {
+            error!(
+                "Updating copy {:?} -> {:?} but {}. Skipping.",
+                source, target.target, comparison
+            );
+            Ok(false)
+        }
+        TemplateComparison::OnlyCacheExists => {
+            warn!(
+                "Updating copy {:?} -> {:?} but {}. Creating it anyways.",
+                source, target.target, comparison
+            );
+            fs.create_dir_all(
+                target
+                    .target
+                    .parent()
+                    .context("get parent of target file")?,
+                &target.owner,
+            )
+            .context("create parent for target file")?;
+            fs.copy_file(source, &target.target, &target.owner)
+                .context("create target copy")?;
+            Ok(true)
+        }
+    }
+}
 
 /// Returns true if the symlink wasn't skipped
 pub fn update_symlink(

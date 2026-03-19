@@ -26,6 +26,15 @@ impl fmt::Display for UnixUser {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
+pub struct CopyTarget {
+    pub target: PathBuf,
+    pub owner: Option<UnixUser>,
+    #[serde(rename = "if")]
+    pub condition: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolicTarget {
     pub target: PathBuf,
     pub owner: Option<UnixUser>,
@@ -49,6 +58,7 @@ pub struct TemplateTarget {
 #[serde(from = "FileTargetOuterRepr", into = "FileTargetOuterRepr")]
 pub enum FileTarget {
     Automatic(PathBuf),
+    Copy(CopyTarget),
     Symbolic(SymbolicTarget),
     #[serde(rename = "template")]
     ComplexTemplate(TemplateTarget),
@@ -66,6 +76,7 @@ enum FileTargetOuterRepr {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum FileTargetInnerRepr {
+    Copy(CopyTarget),
     Symbolic(SymbolicTarget),
     #[serde(rename = "template")]
     ComplexTemplate(TemplateTarget),
@@ -79,6 +90,7 @@ pub type Helpers = BTreeMap<String, PathBuf>;
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultTargetType {
+    Copy,
     Symbolic,
     Template,
     #[default]
@@ -208,6 +220,7 @@ pub fn load_configuration(
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Cache {
+    pub copies: BTreeMap<PathBuf, PathBuf>,
     pub symlinks: BTreeMap<PathBuf, PathBuf>,
     pub templates: BTreeMap<PathBuf, PathBuf>,
 }
@@ -394,6 +407,9 @@ fn merge_configuration_files(
     for value in output.files.values_mut() {
         if let FileTarget::Automatic(target) = value {
             *value = match global.settings.default_target_type {
+                DefaultTargetType::Copy => {
+                    FileTarget::Copy(CopyTarget::from(target.clone()))
+                }
                 DefaultTargetType::Symbolic => {
                     FileTarget::Symbolic(SymbolicTarget::from(target.clone()))
                 }
@@ -425,7 +441,8 @@ impl FileTarget {
     pub fn path(&self) -> &Path {
         match self {
             FileTarget::Automatic(path) => path,
-            FileTarget::Symbolic(SymbolicTarget { target, .. })
+            FileTarget::Copy(CopyTarget { target, .. })
+            | FileTarget::Symbolic(SymbolicTarget { target, .. })
             | FileTarget::ComplexTemplate(TemplateTarget { target, .. }) => target,
         }
     }
@@ -433,7 +450,8 @@ impl FileTarget {
     pub fn set_path(&mut self, new_path: impl Into<PathBuf>) {
         match self {
             FileTarget::Automatic(path) => *path = new_path.into(),
-            FileTarget::Symbolic(SymbolicTarget { target, .. })
+            FileTarget::Copy(CopyTarget { target, .. })
+            | FileTarget::Symbolic(SymbolicTarget { target, .. })
             | FileTarget::ComplexTemplate(TemplateTarget { target, .. }) => {
                 *target = new_path.into();
             }
@@ -443,7 +461,8 @@ impl FileTarget {
     pub fn condition(&self) -> Option<&String> {
         match self {
             FileTarget::Automatic(_) => None,
-            FileTarget::Symbolic(SymbolicTarget { condition, .. })
+            FileTarget::Copy(CopyTarget { condition, .. })
+            | FileTarget::Symbolic(SymbolicTarget { condition, .. })
             | FileTarget::ComplexTemplate(TemplateTarget { condition, .. }) => condition.as_ref(),
         }
     }
@@ -461,6 +480,7 @@ impl From<FileTargetOuterRepr> for FileTarget {
         use FileTargetOuterRepr as OR;
         match input {
             OR::Simple(x) => Self::Automatic(x),
+            OR::Complex(IR::Copy(x)) => Self::Copy(x),
             OR::Complex(IR::Symbolic(x)) => Self::Symbolic(x),
             OR::Complex(IR::ComplexTemplate(x)) => Self::ComplexTemplate(x),
         }
@@ -472,8 +492,19 @@ impl From<FileTarget> for FileTargetOuterRepr {
         use FileTargetInnerRepr as IR;
         match input {
             FileTarget::Automatic(x) => Self::Simple(x),
+            FileTarget::Copy(x) => Self::Complex(IR::Copy(x)),
             FileTarget::Symbolic(x) => Self::Complex(IR::Symbolic(x)),
             FileTarget::ComplexTemplate(x) => Self::Complex(IR::ComplexTemplate(x)),
+        }
+    }
+}
+
+impl<T: Into<PathBuf>> From<T> for CopyTarget {
+    fn from(input: T) -> Self {
+        CopyTarget {
+            target: input.into(),
+            owner: None,
+            condition: None,
         }
     }
 }
@@ -502,6 +533,13 @@ impl<T: Into<PathBuf>> From<T> for TemplateTarget {
 }
 
 impl SymbolicTarget {
+    pub fn into_copy(self) -> CopyTarget {
+        CopyTarget {
+            target: self.target,
+            owner: self.owner,
+            condition: self.condition,
+        }
+    }
     pub fn into_template(self) -> TemplateTarget {
         TemplateTarget {
             target: self.target,
